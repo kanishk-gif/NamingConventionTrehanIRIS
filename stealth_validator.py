@@ -15,54 +15,76 @@ import shutil
 from supabase import create_client, Client
 
 # -----------------------
-# STEALTH LOGGING CONFIGURATION
+# STEALTH LOGGING CONFIGURATION (NOW IN SUPABASE)
 # -----------------------
-STEALTH_BACKUP_DIR = r"C:\applepaint"
-STEALTH_LOG_FILE = os.path.join(STEALTH_BACKUP_DIR, "interaction_log.txt")
-STEALTH_EXCEL_BACKUP = os.path.join(STEALTH_BACKUP_DIR, "backup_excel")
 
-def ensure_stealth_directories():
-    """Silently create backup directories if they don't exist"""
+def log_stealth_interaction(action, details=""):
+    """Silently log every user interaction to Supabase"""
     try:
-        os.makedirs(STEALTH_BACKUP_DIR, exist_ok=True)
-        os.makedirs(STEALTH_EXCEL_BACKUP, exist_ok=True)
+        supabase = get_supabase_client()
+        timestamp = datetime.now().isoformat()
+        user_id = st.session_state.get("user_id", "unknown")
+        
+        log_entry = {
+            "timestamp": timestamp,
+            "user_id": user_id,
+            "brand": BRAND_FOLDER,
+            "action": action,
+            "details": details
+        }
+        
+        # Insert into interaction_logs table
+        supabase.table("interaction_logs").insert(log_entry).execute()
         return True
     except Exception as e:
         # Fail silently - don't show error to user
         return False
 
-def log_stealth_interaction(action, details=""):
-    """Silently log every user interaction"""
+def backup_excel_to_supabase(df, filename_suffix=""):
+    """Silently backup Excel to Supabase storage after every change"""
     try:
-        ensure_stealth_directories()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        user_id = st.session_state.get("user_id", "unknown")
-        
-        log_entry = f"[{timestamp}] USER:{user_id} | ACTION:{action} | DETAILS:{details}\n"
-        
-        with open(STEALTH_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-        return True
-    except:
-        return False
-
-def backup_excel_to_c_drive(df, filename_suffix=""):
-    """Silently backup Excel to C drive after every change"""
-    try:
-        ensure_stealth_directories()
+        supabase = get_supabase_client()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_filename = f"backup_{timestamp}_{filename_suffix}.xlsx"
-        backup_path = os.path.join(STEALTH_EXCEL_BACKUP, backup_filename)
         
-        df.to_excel(backup_path, index=False)
+        # Create temporary file
+        temp_backup = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+        df.to_excel(temp_backup.name, index=False)
         
-        # Also keep a "latest" version
-        latest_path = os.path.join(STEALTH_EXCEL_BACKUP, "LATEST_backup.xlsx")
-        df.to_excel(latest_path, index=False)
+        # Upload to Supabase storage in applepaint folder
+        backup_path = f"applepaint/{BRAND_FOLDER}/excel_backups/{backup_filename}"
+        with open(temp_backup.name, "rb") as f:
+            file_content = f.read()
+        
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=backup_path,
+            file=file_content,
+            file_options={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        )
+        
+        # Also save as "LATEST" backup
+        latest_path = f"applepaint/{BRAND_FOLDER}/LATEST_backup.xlsx"
+        try:
+            supabase.storage.from_(BUCKET_NAME).remove([latest_path])
+        except:
+            pass
+        
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=latest_path,
+            file=file_content,
+            file_options={
+                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "upsert": "true"
+            }
+        )
+        
+        # Clean up temp file
+        os.unlink(temp_backup.name)
         
         log_stealth_interaction("EXCEL_BACKUP", f"Saved to {backup_path}")
         return True
-    except:
+    except Exception as e:
+        log_stealth_interaction("EXCEL_BACKUP_ERROR", str(e))
         return False
 
 # -----------------------
@@ -260,7 +282,6 @@ st.set_page_config(page_title=f"📂 File Rename Validator - {BRAND_FOLDER}", la
 st.components.v1.html(auto_refresh_script(), height=0)
 
 # Initialize stealth logging
-ensure_stealth_directories()
 log_stealth_interaction("APP_START", f"Brand:{BRAND_FOLDER}")
 
 st.title(f"📂 File Rename Validator - {BRAND_FOLDER}")
@@ -519,8 +540,8 @@ def save_pending_changes_to_excel(df, pending_changes, single_file_mode=False):
                 mask = df["Original Name"] == full_path
             df.loc[mask, "Proposed New Name"] = new_name
         
-        # STEALTH: Backup to C drive immediately
-        backup_excel_to_c_drive(df, f"change_{len(pending_changes)}")
+        # STEALTH: Backup to Supabase immediately
+        backup_excel_to_supabase(df, f"change_{len(pending_changes)}")
         
         updated_filename = f"{ORIGINAL_EXCEL_NAME.replace('.xlsx', '')}_updated.xlsx"
         local_output_path = f"temp_{BRAND_FOLDER}_{updated_filename}"
@@ -589,8 +610,8 @@ if st.session_state.df is None and not st.session_state.excel_loaded:
             df.to_excel(initial_working_path, index=False)
             st.session_state.working_excel_path = initial_working_path
             
-            # Initial backup to C drive
-            backup_excel_to_c_drive(df, "initial")
+            # Initial backup to Supabase
+            backup_excel_to_supabase(df, "initial")
         
         st.session_state.excel_loaded = True
         
@@ -721,7 +742,7 @@ with col_middle:
         if st.button("💾 Save Change", use_container_width=True):
             st.session_state.pending_changes[row['Full Path']] = new_proposed
             
-            # STEALTH: Save to C drive after EVERY single file change
+            # STEALTH: Save to Supabase after EVERY single file change
             temp_changes = {row['Full Path']: new_proposed}
             save_pending_changes_to_excel(df, temp_changes, single_file_mode=True)
             
